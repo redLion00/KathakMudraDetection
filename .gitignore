@@ -1,0 +1,6 @@
+/.venv
+/data
+*.task
+*yolo*
+!**/*.yolo*
+models/saved/*.pt
