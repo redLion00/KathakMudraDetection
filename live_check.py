@@ -193,12 +193,24 @@ def load_tcn(checkpoint_path, num_classes, device):
 
 # ── LANDMARK HELPERS (same as extraction notebook) ────────────────────────
 def normalize_hand(points: np.ndarray) -> np.ndarray:
-    points = points.copy()
-    points -= points[0]
-    scale = np.max(np.linalg.norm(points, axis=1))
+    """
+    Wrist-centred unit normalisation on xy columns ONLY.
+    The original version included the confidence channel in both the
+    translation (points -= points[0]) and the scale
+    (np.linalg.norm over all 3 columns), causing the normalised xy
+    values to vary with detection confidence.  Because training videos
+    (studio/stage) have higher RTMPose confidence than a live webcam,
+    the same physical hand shape produced different feature vectors at
+    train time vs inference time, degrading live classification accuracy.
+    """
+    out = points.copy()
+    xy  = out[:, :2]                              # x, y only
+    xy -= xy[0]                                   # translate: wrist → origin
+    scale = np.max(np.linalg.norm(xy, axis=1))   # scale from xy distances only
     if scale > 0:
-        points /= scale
-    return points
+        xy /= scale
+    # confidence column is intentionally left untouched
+    return out
 
 def _pick_person(keypoints, scores):
     if keypoints.shape[0] == 0:
@@ -207,10 +219,33 @@ def _pick_person(keypoints, scores):
     return keypoints[idx], scores[idx]
 
 def _body_array(kps, sc, frame_w, frame_h):
+    """
+    Returns (17, 3): shoulder-relative x/y + confidence.
+
+    Normalisation steps (must match landmark_extraction.ipynb exactly):
+      1. Translate by shoulder midpoint (COCO 5=left, 6=right shoulder) so
+         absolute screen position is removed.
+      2. Scale by shoulder width so camera distance is removed.
+
+    Fallback to plain frame-normalised coords if either shoulder is below
+    CONF_THR (e.g. performer is side-on or partially occluded).
+    """
     body = np.zeros((BODY_POINTS, 3), dtype=np.float32)
     body[:, 0] = kps[:BODY_POINTS, 0] / frame_w
     body[:, 1] = kps[:BODY_POINTS, 1] / frame_h
     body[:, 2] = sc[:BODY_POINTS]
+
+    l_conf = sc[5]
+    r_conf = sc[6]
+
+    if l_conf > CONF_THR and r_conf > CONF_THR:
+        shoulder_l     = body[5, :2].copy()
+        shoulder_r     = body[6, :2].copy()
+        midpoint       = (shoulder_l + shoulder_r) * 0.5
+        shoulder_width = np.linalg.norm(shoulder_l - shoulder_r)
+        if shoulder_width > 1e-4:
+            body[:, :2] = (body[:, :2] - midpoint) / shoulder_width
+
     return body
 
 def _hand_array(kps, sc, hand_slice, frame_w, frame_h):
@@ -222,7 +257,11 @@ def _hand_array(kps, sc, hand_slice, frame_w, frame_h):
     pts[:, 0] = hand_kps[:, 0] / frame_w
     pts[:, 1] = hand_kps[:, 1] / frame_h
     pts[:, 2] = hand_sc
-    pts[hand_sc <= CONF_THR, :2] = 0.0
+    # Set low-confidence keypoints to the wrist position so they land at
+    # [0, 0] after normalize_hand's wrist subtraction ('unknown → at wrist').
+    # Previously they were zeroed to the frame origin, which after wrist
+    # subtraction became [-x_wrist, -y_wrist] — frame-position-dependent noise.
+    pts[hand_sc <= CONF_THR, :2] = pts[0, :2]
     return normalize_hand(pts)
 
 def extract_frame_landmarks(frame, wholebody):
@@ -289,7 +328,7 @@ def run_inference(model, buffer, device):
     return top3[0]["class"], top3[0]["confidence"], top3
 
 # ── DRAW HUD ──────────────────────────────────────────────────────────────
-def draw_hud(frame, pred_class, confidence, top3, buffer_len, collecting):
+def draw_hud(frame, pred_class, confidence, top3, buffer_len, state):
     h, w = frame.shape[:2]
 
     # Background panel
@@ -299,11 +338,17 @@ def draw_hud(frame, pred_class, confidence, top3, buffer_len, collecting):
 
     # Buffer progress bar
     bar_w  = int(340 * min(buffer_len / TARGET_FRAMES, 1.0))
-    status = "COLLECTING" if collecting else "PREDICTING"
-    color  = (0, 255, 100) if collecting else (0, 200, 255)
+    # State colours: grey=idle, green=capturing, cyan=predicting, orange=frozen
+    status_map = {
+        IDLE:       ("IDLE  —  press SPACE to start capture",  (150, 150, 150)),
+        CAPTURING:  ("CAPTURING  —  hold your mudra...",       (0,   255, 100)),
+        PREDICTING: ("PREDICTING...",                          (0,   200, 255)),
+        FROZEN:     ("RESULT  —  press SPACE for next mudra",  (0,   165, 255)),
+    }
+    status, color = status_map.get(state, ("UNKNOWN", (255, 255, 255)))
     cv2.rectangle(frame, (10, 130), (350, 148), (50, 50, 50), -1)
     cv2.rectangle(frame, (10, 130), (10 + bar_w, 148), color, -1)
-    cv2.putText(frame, f"{status}  {buffer_len}/{TARGET_FRAMES}",
+    cv2.putText(frame, f"{status}  [{buffer_len}/{TARGET_FRAMES}]",
                 (10, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
 
     if pred_class is None:
@@ -333,6 +378,14 @@ def draw_hud(frame, pred_class, confidence, top3, buffer_len, collecting):
     return frame
 
 # ── MAIN LOOP ─────────────────────────────────────────────────────────────
+# ── INFERENCE STATES ──────────────────────────────────────────────────────────
+# IDLE       : camera running, buffer filling passively, no result shown
+# CAPTURING  : Space pressed — buffer reset, collecting a fresh gesture window
+# PREDICTING : buffer just hit TARGET_FRAMES — run model exactly once
+# FROZEN     : result displayed, waiting for the next Space press
+IDLE, CAPTURING, PREDICTING, FROZEN = "IDLE", "CAPTURING", "PREDICTING", "FROZEN"
+
+
 def run_live_classification():
     model = load_tcn(CHECKPOINT_PATH, len(CLASSES), DEVICE)
 
@@ -350,65 +403,109 @@ def run_live_classification():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
-    # Rolling buffer — always keep last TARGET_FRAMES landmarks
     buffer     = deque(maxlen=TARGET_FRAMES)
     pred_class = None
     confidence = 0.0
     top3       = []
-
-    print("Camera open. Perform a mudra — press R to reset, Q to quit.")
+    state      = IDLE
 
     cap_fps      = cap.get(cv2.CAP_PROP_FPS) or 30.0
     frame_stride = max(1, int(round(cap_fps / TARGET_FPS)))
     frame_idx    = 0
+
+    print("Camera open.")
+    print("  SPACE — start a new capture window (~11 s at 15 fps).")
+    print("          Hold your mudra steady throughout, then the result")
+    print("          appears automatically when the window fills.")
+    print("  R     — clear buffer and result, return to IDLE.")
+    print("  Q     — quit.")
 
     while True:
         ret, frame = cap.read()
         if not ret:
             print("Camera read failed.")
             break
-        frame_idx += 1
-        if frame_idx % frame_stride != 0:
-            cv2.imshow("Mudra Live Classification", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-            continue
 
-        # ── Extract landmarks for this frame ──────────────────
-        lm = extract_frame_landmarks(frame, wholebody)  # (59, 3)
-        buffer.append(lm)
-
-        collecting = len(buffer) < TARGET_FRAMES
-
-        # ── Run inference once buffer is full ─────────────────
-        if not collecting:
-            buf_arr    = np.stack(buffer, axis=0)        # (172, 59, 3)
-            pred_class, confidence, top3 = run_inference(model, buf_arr, DEVICE)
-
-        # ── Draw skeleton overlay ──────────────────────────────
-        # Draw hand landmarks on frame for visual feedback
-        if len(buffer) > 0:
-            last_lm   = buffer[-1]                       # (59, 3)
-            fh, fw    = frame.shape[:2]
-            for idx in range(17, 59):                    # hands only
-                x = int(last_lm[idx, 0] * fw)
-                y = int(last_lm[idx, 1] * fh)
-                if x > 0 or y > 0:
-                    cv2.circle(frame, (x, y), 3, (0, 255, 200), -1)
-
-        # ── Draw HUD ──────────────────────────────────────────
-        frame = draw_hud(frame, pred_class, confidence,
-                         top3, len(buffer), collecting)
-
-        cv2.imshow("Mudra Live Classification", frame)
-
+        # ── Keypress handling (checked every raw camera frame) ────────────
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
+        elif key == ord(' '):
+            # Begin a fresh capture regardless of current state
+            buffer.clear()
+            pred_class = None
+            confidence = 0.0
+            top3       = []
+            state      = CAPTURING
+            print(f"Capturing — hold mudra for ~{TARGET_FRAMES / TARGET_FPS:.0f} s ...")
         elif key == ord('r'):
             buffer.clear()
             pred_class = None
-            print("Buffer reset.")
+            confidence = 0.0
+            top3       = []
+            state      = IDLE
+            print("Reset.")
+
+        # ── Throttle to TARGET_FPS for landmark extraction ────────────────
+        frame_idx += 1
+        if frame_idx % frame_stride != 0:
+            # Still render the HUD on every camera frame for smooth display
+            cv2.imshow("Mudra Live Classification",
+                       draw_hud(frame, pred_class, confidence,
+                                top3, len(buffer), state))
+            continue
+
+        # ── Extract landmarks ─────────────────────────────────────────────
+        lm = extract_frame_landmarks(frame, wholebody)  # (59, 3)
+
+        # Only push to buffer while actively capturing (or in IDLE to keep
+        # the buffer warm so the user can see skeleton tracking immediately)
+        if state in (IDLE, CAPTURING):
+            buffer.append(lm)
+
+        # ── Trigger inference once the capture window is full ─────────────
+        if state == CAPTURING and len(buffer) == TARGET_FRAMES:
+            state = PREDICTING
+
+        if state == PREDICTING:
+            buf_arr    = np.stack(buffer, axis=0)        # (172, 59, 3)
+            pred_class, confidence, top3 = run_inference(model, buf_arr, DEVICE)
+            state      = FROZEN
+            verdict    = pred_class if confidence >= CONFIDENCE_THR else f"uncertain ({pred_class})"
+            print(f"Result: {verdict}  ({confidence:.1%})")
+
+        # ── Skeleton overlay ──────────────────────────────────────────────
+        # Body landmarks are shoulder-relative; hand landmarks are
+        # wrist-relative.  Neither can be drawn directly with *fw/fh.
+        # We back-project using approximate pixel scales derived from fh.
+        if len(buffer) > 0:
+            last_lm      = buffer[-1]     # (59, 3)
+            fh, fw       = frame.shape[:2]
+            # Shoulder width ≈ 22% of frame height at a typical webcam distance
+            shoulder_w_px = max(1, int(fh * 0.22))
+            # Hand span ≈ 12% of frame height in the same setup
+            hand_span_px  = max(1, int(fh * 0.12))
+            # Approximate shoulder midpoint screen position
+            # (body[5] and body[6] are shoulder-relative, so ~(-0.5,y) and (0.5,y))
+            mid_x = fw // 2
+            mid_y = int(fh * 0.35)
+
+            for hand_start, body_wrist_idx in [(17, 9), (38, 10)]:
+                # Back-project body wrist from shoulder-relative → screen px
+                bw_x = mid_x + int(last_lm[body_wrist_idx, 0] * shoulder_w_px)
+                bw_y = mid_y + int(last_lm[body_wrist_idx, 1] * shoulder_w_px)
+                for idx in range(hand_start, hand_start + HAND_POINTS):
+                    rel_x = last_lm[idx, 0]
+                    rel_y = last_lm[idx, 1]
+                    if rel_x == 0.0 and rel_y == 0.0:
+                        continue          # low-confidence keypoint
+                    x = bw_x + int(rel_x * hand_span_px)
+                    y = bw_y + int(rel_y * hand_span_px)
+                    cv2.circle(frame, (x, y), 3, (0, 255, 200), -1)
+
+        # ── Draw HUD and display ──────────────────────────────────────────
+        frame = draw_hud(frame, pred_class, confidence, top3, len(buffer), state)
+        cv2.imshow("Mudra Live Classification", frame)
 
     cap.release()
     cv2.destroyAllWindows()
