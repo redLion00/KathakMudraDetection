@@ -1,6 +1,6 @@
 # Kathak Mudra Detection
 
-A deep learning pipeline for recognizing **Kathak hand mudras (gestures)** from video, using full-body/hand pose landmarks and a Temporal Convolutional Network (TCN) with self-attention. The project covers the full workflow — from raw video preprocessing and landmark extraction, to model training, to real-time mudra classification via webcam.
+A deep learning pipeline for recognizing **Kathak hand mudras (gestures)** from video, using full-body/hand pose landmarks and a Temporal Convolutional Network (TCN) with self-attention. The project covers the full workflow  from raw video preprocessing and landmark extraction, to model training, to real-time mudra classification via webcam.
 
 ## Overview
 
@@ -92,7 +92,7 @@ pip install torch opencv-python numpy pandas scipy rtmlib onnxruntime
    ```
    Press **R** to reset the frame buffer, and **Q** to quit.
 
-> Note: `live_check.py` currently references local paths (e.g., the CSV path and checkpoint path) — update `CHECKPOINT_PATH` and the CSV path in the script to match your local setup before running.
+> Note: `live_check.py` currently references local paths (e.g., the CSV path and checkpoint path)  update `CHECKPOINT_PATH` and the CSV path in the script to match your local setup before running.
 
 ## Model Details
 
@@ -104,6 +104,4 @@ pip install torch opencv-python numpy pandas scipy rtmlib onnxruntime
 | Pooling | Global average pooling over time |
 | Output | Softmax over mudra classes |
 
-## License
 
-No license specified yet — add one if you intend to share or open-source this work.
