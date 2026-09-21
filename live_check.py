@@ -1,3 +1,4 @@
+import os
 import cv2
 import numpy as np
 import torch
@@ -9,10 +10,14 @@ from rtmlib import Wholebody
 from torch.amp import autocast
 import pandas as pd
 
-df = pd.read_csv("C:\\Users\\Vivek\\projects\\KathakMudraDetection\\VideoReport_updated.csv")  # for class names
+# ── PATHS (relative to this script's location, not a hardcoded user path) ─
+BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
+REPORT_PATH = os.path.join(BASE_DIR, "VideoReport_updated.csv")
+
+df = pd.read_csv(REPORT_PATH)  # for class names
 
 # ── CONFIG ────────────────────────────────────────────────────────────────
-CHECKPOINT_PATH  = "models/saved/best_tcn.pt"
+CHECKPOINT_PATH  = os.path.join(BASE_DIR, "models", "saved", "best_tcn.pt")
 TARGET_FRAMES    = 172
 CONFIDENCE_THR   = 0.60        # below this → show "uncertain"
 CAMERA_IDX       = 0
