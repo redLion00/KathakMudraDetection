@@ -1,6 +1,15 @@
-/.venv
-/data
+/.venv/
+.env
+/data/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
 *.task
 *yolo*
 !**/*.yolo*
 models/saved/*.pt
+models/saved/seeds/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

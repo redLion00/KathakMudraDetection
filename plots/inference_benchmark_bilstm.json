@@ -1,0 +1,23 @@
+{
+  "model": "BiLSTM",
+  "device": "NVIDIA GeForce RTX 4070 Laptop GPU",
+  "torch": "2.9.1+cu130",
+  "cuda": "13.0",
+  "precision": "FP32 (no autocast)",
+  "batch_size": 32,
+  "input_shape": [
+    32,
+    172,
+    236
+  ],
+  "n_warmup": 20,
+  "n_runs": 100,
+  "sync": "torch.cuda.synchronize() around every timed forward pass",
+  "mean_ms": 45.55803299997933,
+  "std_ms": 3.1769787180324593,
+  "median_ms": 45.8056500647217,
+  "per_clip_ms": 1.4236885312493541,
+  "throughput_clips_per_s": 702.4008257778495,
+  "peak_gpu_mem_MB": 608.1630859375,
+  "note": "Model forward pass only; excludes video decoding, pose estimation and preprocessing."
+}

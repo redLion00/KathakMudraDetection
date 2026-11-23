@@ -1,133 +1,119 @@
-import pandas as pd
-import cv2
-import os
-import numpy as np
+"""Step 1 - quality control. Writes VideoReport.csv (one row per clip, every clip, with reasons)."""
+import hashlib
 from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
 
-PATH = r'data\Videos'
+import cv2
+import numpy as np
+import pandas as pd
 
-def sample_frame(path, step=10):
-    frame = cv2.VideoCapture(path)
-    frames = []
-    count = 0
-    while True:
-        ret, img = frame.read()
-        if not ret:
-            break
-        if count % step == 0:
-            frames.append(img)
-        count += 1
-    frame.release()
-    return frames
+from config import *
 
-def blur_score(frame):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    score = cv2.Laplacian(gray, cv2.CV_64F).var()
-    return score
+FLAGS = ["blur_ok", "brightness_ok", "fps_ok", "resolution_ok", "duration_ok"]
 
-def brightness_score(frame):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    return np.mean(gray)
 
-def stability_score(frames):
-    prev_gray = cv2.cvtColor(frames[0], cv2.COLOR_BGR2GRAY)
-    motions = []
-    for frame in frames[1:]:
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        flow = cv2.calcOpticalFlowFarneback(
-            prev_gray, gray,
-            None,  # type: ignore
-            0.5, 3, 15, 3, 5, 1.2, 0
-        )
-        magnitude = np.mean(np.sqrt(flow[..., 0]**2 + flow[..., 1]**2))
-        motions.append(magnitude)
-        prev_gray = gray
-    return np.mean(motions)
+def sha1_file(path, chunk=1 << 20):
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
 
-def fps_check(cap):
-    return cap.get(cv2.CAP_PROP_FPS)
 
-def analyze_video(path):
+def video_key(path: Path) -> str:
+    """Platform-independent id, e.g. '1-Ardhpatka/IMG_1246.mp4' (always forward slash)."""
+    return f"{path.parent.name}/{path.name}"
+
+
+def analyze_video(path_str):
     cv2.setNumThreads(1)
-    print("Processing: ", path)
-    relative_path = os.path.join(os.path.basename(os.path.dirname(path)), os.path.basename(path))
-    mudra_label = os.path.basename(os.path.dirname(path)).split("-", 1)[1]
-
+    path = Path(path_str)
+    class_dir = path.parent.name
+    label = class_dir.split("-", 1)[1] if "-" in class_dir else class_dir
+    row = {"video": video_key(path), "class_dir": class_dir, "mudra_label": label,
+           "status": "OK", "sha1": None, "width": None, "height": None, "frame_count": None,
+           "duration_sec": None, "fps": None, "blur": None, "brightness": None, "stability": None}
+    row.update({f: False for f in FLAGS})
     try:
-        cap = cv2.VideoCapture(path)
+        row["sha1"] = sha1_file(path)
+        cap = cv2.VideoCapture(path_str)
         if not cap.isOpened():
-            print(f"  Could not open: {path}")
-            return {"video": relative_path, "mudra_label": mudra_label, "status": "FAILED"}
-
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps = fps_check(cap)
+            row["status"] = "FAILED"
+            return finalize(row)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        row.update(width=int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                   height=int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+                   frame_count=int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
         cap.release()
+        row["fps"] = round(fps, 2)
+        row["duration_sec"] = round(row["frame_count"] / fps, 2) if fps > 0 else 0
 
-        duration_sec = round(frame_count / fps, 2) if fps > 0 else 0
+        blurs, brights, motions, first_hw, prev, n = [], [], [], None, None, 0
+        cap = cv2.VideoCapture(path_str)
+        while True:
+            ok, img = cap.read()
+            if not ok:
+                break
+            if n % SAMPLE_STEP == 0:                      # streaming: no list of frames in RAM
+                if first_hw is None:
+                    first_hw = img.shape[:2]
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                blurs.append(cv2.Laplacian(gray, cv2.CV_64F).var())
+                brights.append(float(gray.mean()))
+                if COMPUTE_STABILITY and prev is not None:
+                    flow = cv2.calcOpticalFlowFarneback(prev, gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)  # type: ignore
+                    motions.append(float(np.mean(np.hypot(flow[..., 0], flow[..., 1]))))
+                prev = gray
+            n += 1
+        cap.release()
+        if not blurs:
+            row["status"] = "FAILED"
+            return finalize(row)
 
-        frames = sample_frame(path, 5)
-        if len(frames) == 0:
-            print(f"  No frames extracted: {path}")
-            return {"video": relative_path, "mudra_label": mudra_label, "status": "FAILED"}
-        
-        h, w = frames[0].shape[:2]
-        avg_blur = np.mean([blur_score(f) for f in frames])
-        avg_brightness = np.mean([brightness_score(f) for f in frames])
-        stability = stability_score(frames)
-
-        blur_ok = True if avg_blur >= 18 else False
-        brightness_ok = True if avg_brightness >= 50 else False
-        fps_ok = True if fps >= 15 else False
-        resolution_ok = True if (w >= 480 and h >= 640) else False
-        duration_ok = True if duration_sec >= 5 else False
-
-        return {
-            "video": relative_path,
-            "mudra_label": mudra_label,
-            "width": width,
-            "height": height,
-            "frame_count": frame_count,
-            "duration_sec": duration_sec,
-            "fps": round(fps, 2),
-            "blur": round(avg_blur, 2),
-            "brightness": round(avg_brightness, 2),
-            "stability": round(stability, 2),
-
-            # flags #fuck u IMG_1246.mp4
-            "blur_ok": blur_ok,
-            "brightness_ok": brightness_ok,
-            "fps_ok": fps_ok,
-            "resolution_ok": resolution_ok,
-            "duration_ok": duration_ok
-        }
-
-    except Exception as e:
-        print(f"  ERROR on {path}: {e}")
-        return {"video": relative_path, "mudra_label": mudra_label, "status": f"ERROR: {e}"}
+        h, w = first_hw
+        row.update(blur=round(float(np.mean(blurs)), 2), brightness=round(float(np.mean(brights)), 2),
+                   stability=round(float(np.mean(motions)), 2) if motions else None,
+                   blur_ok=bool(np.mean(blurs) >= BLUR_MIN),
+                   brightness_ok=bool(np.mean(brights) >= BRIGHTNESS_MIN),
+                   fps_ok=bool(fps >= FPS_MIN),
+                   resolution_ok=bool(w >= WIDTH_MIN and h >= HEIGHT_MIN),
+                   duration_ok=bool(row["duration_sec"] >= DURATION_MIN_S))
+    except Exception as e:                                  # keep a full row, never a partial one
+        row["status"] = f"ERROR: {e}"
+    return finalize(row)
 
 
-def main(path):
-    formats = ('.mp4', '.mov')
-    video_paths = []
-    max_workers = min(8, os.cpu_count() or 1)
+def finalize(row):
+    reasons = []
+    if row["status"] != "OK":
+        reasons.append("unreadable")
+    else:
+        for flag in FLAGS:
+            if not row[flag] and (flag != "blur_ok" or ENFORCE_BLUR):
+                reasons.append(flag.replace("_ok", ""))
+    row["qc_pass"] = len(reasons) == 0
+    row["exclusion_reason"] = ";".join(reasons)
+    row["blur_overridden"] = bool(row["status"] == "OK" and not row["blur_ok"] and not ENFORCE_BLUR)
+    return row
 
-    for dirs in os.listdir(path):
-        dir_path = os.path.join(path, dirs)
-        if not os.path.isdir(dir_path):
-            continue
-        for file in os.listdir(dir_path):
-            if file.lower().endswith(formats):
-                video_paths.append(os.path.join(dir_path, file))
 
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        results = list(executor.map(analyze_video, video_paths))
+def main():
+    paths = sorted(str(p) for d in VIDEO_ROOT.iterdir() if d.is_dir()
+                   for p in d.iterdir() if p.suffix.lower() in VIDEO_EXTS)
+    with ProcessPoolExecutor(max_workers=min(8, __import__("os").cpu_count() or 1)) as ex:
+        rows = list(ex.map(analyze_video, paths))
+    df = pd.DataFrame(rows)
+    df["dup_sha1"] = df["sha1"].notna() & df["sha1"].duplicated(keep=False)   # exact duplicate files
+    df.to_csv(REPORT_CSV, index=False)
+    print(f"{len(df)} clips | qc_pass {int(df.qc_pass.sum())} | exact duplicates {int(df.dup_sha1.sum())}")
+    if (~df.qc_pass).any():
+        print(df.loc[~df.qc_pass, "exclusion_reason"].value_counts().to_string())
+    if (df.blur_overridden).any():
+        print(f"blur threshold overridden for {int(df.blur_overridden.sum())} clips (ENFORCE_BLUR=False)")
 
-    results = [r for r in results if r is not None]
-    df = pd.DataFrame(results)
-    df.to_csv('VideoReport.csv', index=False)
-    print(f"\nReport saved. {len(df)} videos analyzed.")
 
 if __name__ == "__main__":
-    main(PATH)
+    main()
